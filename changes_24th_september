@@ -1,0 +1,803 @@
+--- a/deepstream_app_reid.py
++++ b/deepstream_app_reid.py
+@@ -16,7 +16,7 @@
+ from pyservicemaker import Pipeline ,Probe ,BatchMetadataOperator
+ from pyservicemaker import osd as _osd
+ 
+-from person_db import PersonDatabase ,DEFAULT_OBJECT_CLASS
++from person_db import PersonDatabase ,DEFAULT_OBJECT_CLASS ,MATCH_MAX_AGE_SEC
+ from shutdown_handler import ShutdownManager
+ 
+ CAMERA_STREAMS =[
+@@ -286,7 +286,7 @@
+ CROSS_MARGIN =float (os .environ .get ("REID_CROSS_MARGIN","0.10"))
+ POSTURE_THRESHOLD =float (os .environ .get ("REID_POSTURE_THR","0.60"))
+ POSTURE_WINDOW_SEC =float (os .environ .get ("REID_POSTURE_WINDOW","12.0"))
+-DUP_REAP_MIN_SIM =float (os .environ .get ("REID_DUP_REAP_MIN_SIM","0.72"))
++DUP_REAP_MIN_SIM =float (os .environ .get ("REID_DUP_REAP_MIN_SIM","0.85"))
+ SOFT_WINDOW =1800.0
+ MAX_EMBEDDINGS =60
+ 
+@@ -545,6 +545,15 @@
+ tracker_temp_uid ={}
+ 
+ TEMP_UID_HEX_LEN =14
++REAL_UID_LEN =9   # person_db mints 8 random chars + 1 check char
++
++def _is_temp_uid (pid ):
++    """True for a temporary UID ('T' + 14 hex chars) -- and for the bare 'T'
++    sentinel used as a .get() default. Real UIDs are 9 characters drawn from an
++    alphabet that ITSELF contains 'T', so a plain startswith("T") wrongly treats
++    ~1 in 30 real UIDs as temporary (the track then re-commits every frame and
++    mints spurious extra UIDs)."""
++    return pid [:1 ]=="T"and len (pid )!=REAL_UID_LEN
+ 
+ def _new_temp_uid ():
+     """Generate a fresh, random, alphanumeric temporary UID using Python's
+@@ -594,6 +603,24 @@
+ _probe_ms =deque (maxlen =300 )
+ _diag_last_frames =0
+ 
++# --- UID-safety layer (env-tunable; CANNOT_LINK_ENABLE=0 disables the whole layer) ---
++def _env_flag (name ,default ="1"):
++    return os .environ .get (name ,default )not in ("0","false","False","")
++CANNOT_LINK_ENABLE =_env_flag ("CANNOT_LINK_ENABLE")
++PRESENT_WINDOW =float (os .environ .get ("PRESENT_WINDOW","1.0"))
++DUP_BOX_IOMIN =float (os .environ .get ("DUP_BOX_IOMIN","0.50"))
++COEXIST_MIN_SEC =float (os .environ .get ("COEXIST_MIN_SEC","1.0"))
++SAFETY_PASS_INTERVAL =float (os .environ .get ("SAFETY_PASS_INTERVAL","0.25"))
++HOLDER_GRACE =float (os .environ .get ("HOLDER_GRACE","5.0"))
++LEGACY_HOLD =_env_flag ("LEGACY_HOLD","0")
++CROWD_IOMIN =float (os .environ .get ("CROWD_IOMIN","0.20"))
++RECOVER_MIN_SIM =float (os .environ .get ("RECOVER_MIN_SIM","0.45"))
++NEW_DIAG =_env_flag ("NEW_DIAG")
++_track_last_box ={}
++_coexist_since ={}
++_last_safety_ts =0.0
++_uid_safety ={"conflicts":0 ,"reap_skipped":0 ,"cl_pairs":0 }
++
+ _cam_frames =defaultdict (int )
+ _cam_raw =defaultdict (int )
+ _cam_persons =defaultdict (int )
+@@ -617,7 +644,7 @@
+         confs =[sum (h )/len (h )for h in (tracker_conf_hist [k ]for k in _live )]
+         confs .sort ()
+         _committed =sum (1 for k in _live
+-        if not str (tracker_to_person .get (k ,"T")).startswith ("T"))
++        if not _is_temp_uid (str (tracker_to_person .get (k ,"T"))))
+         _p =lambda q :confs [min (len (confs )-1 ,int (q *len (confs )))]
+         print (f"[APPEARANCE {tag }] {len (_live )} live tracks "
+         f"({_committed } committed, {len (_appearance_confirmed )} appearance-"
+@@ -1111,7 +1138,8 @@
+         _last_gallery_update .pop (key ,None )
+         _last_gallery_update .pop (("merge",key ),None )
+         _reid_health ["track_samples"].pop (key ,None )
+-    for _d in (_incident_touch_ts ,_mc_obs_ts ,_reap_last_ts ):
++        _track_last_box .pop (key ,None )
++    for _d in (_incident_touch_ts ,_mc_obs_ts ,_reap_last_ts ,_coexist_since ):
+         for _k in [k for k ,ts in _d .items ()if now -ts >TRACKER_TIMEOUT ]:
+             _d .pop (_k ,None )
+     _now =time .time ()
+@@ -1277,6 +1305,16 @@
+     union =aw *ah +bw *bh -inter
+     return inter /union if union >0 else 0.0
+ 
++def _box_iomin (a ,b ):
++    """Intersection over the SMALLER box's area. >= DUP_BOX_IOMIN means one box
++    is (mostly) inside the other -> the same physical person (duplicate box);
++    below it the two boxes are two different people."""
++    ix1 ,iy1 =max (a [0 ],b [0 ]),max (a [1 ],b [1 ])
++    ix2 ,iy2 =min (a [0 ]+a [2 ],b [0 ]+b [2 ]),min (a [1 ]+a [3 ],b [1 ]+b [3 ])
++    inter =max (0.0 ,ix2 -ix1 )*max (0.0 ,iy2 -iy1 )
++    m =min (a [2 ]*a [3 ],b [2 ]*b [3 ])
++    return inter /m if m >0 else 0.0
++
+ def is_static_box (tkey ,cx ,cy ,now ):
+     if not STATIC_FLAG_ENABLE :
+         return False
+@@ -1314,6 +1352,41 @@
+             kept .append ((oid ,box ))
+     return suppressed
+ 
++def crowded_objects (frame_meta ,suppressed ,src_idx ,iomin_thr =None ):
++    """Object ids whose box overlaps ANOTHER validated person's box by more
++    than CROWD_IOMIN (of the smaller box). Their crops contain two people, so
++    they must not feed an identity buffer or gallery -- overlapped crops are the
++    classic source of fused identities. Only validated persons (committed UID
++    or motion-confirmed) count, so an empty-chair false positive sitting under a
++    seated person never blocks that person's gallery. CROWD_IOMIN<=0 disables."""
++    thr =CROWD_IOMIN if iomin_thr is None else iomin_thr
++    if thr <=0 :
++        return set ()
++    boxes =[]
++    for o in frame_meta .object_items :
++        try :
++            oid =o .object_id
++            if oid in suppressed :
++                continue
++            if float (o .confidence )<MIN_DET_CONFIDENCE :
++                continue
++            k =(src_idx ,int (oid ))
++            if tracker_hits .get (k ,0 )<MIN_TRACK_HITS :
++                continue
++            p =tracker_to_person .get (k ,"T")
++            if _is_temp_uid (p )and not tracker_ever_moved .get (k ,False ):
++                continue
++            r =o .rect_params
++            boxes .append ((oid ,(float (r .left ),float (r .top ),float (r .width ),float (r .height ))))
++        except Exception :
++            pass
++    out =set ()
++    for i in range (len (boxes )):
++        for j in range (i +1 ,len (boxes )):
++            if _box_iomin (boxes [i ][1 ],boxes [j ][1 ])>thr :
++                out .add (boxes [i ][0 ]);out .add (boxes [j ][0 ])
++    return out
++
+ def expand_box (rect_params ,frame_w =FRAME_W ,frame_h =FRAME_H ):
+ 
+     r =rect_params
+@@ -1475,7 +1548,7 @@
+             first_dt =datetime .fromtimestamp (first_ts )
+             last_dt =datetime .fromtimestamp (last_ts )
+             uid_first =""
+-            if DB is not None and not pid .startswith ("T"):
++            if DB is not None and not _is_temp_uid (pid ):
+                 try :
+                     _ ,uid_first =DB .first_seen_of (pid )
+                 except Exception :
+@@ -1563,7 +1636,7 @@
+     cut =now -hold
+     best_pid ,best_iou =None ,iou_thr
+     for k ,p in tracker_to_person .items ():
+-        if p .startswith ("T"):
++        if _is_temp_uid (p ):
+             continue
+         if k [0 ]!=src_idx :
+             continue
+@@ -1626,7 +1699,7 @@
+     _repoint_sessions (drop_pid ,keep_pid )
+ 
+ 
+-def _recover_local_uid (src_idx ,box ,now ,active_pids ,object_class =DEFAULT_OBJECT_CLASS ):
++def _recover_local_uid (src_idx ,box ,now ,active_pids ,object_class =DEFAULT_OBJECT_CLASS ,vec =None ):
+     """If a fresh tracker id's box matches a recently-lost UID on the same
+     camera, return that UID to inherit. active_pids are UIDs currently held by
+     OTHER live tracks (never steal an in-use identity). object_class restricts
+@@ -1648,6 +1721,14 @@
+             continue
+         if DB .class_of (p )!=object_class :
+             continue
++        if vec is not None and RECOVER_MIN_SIM >0 :
++            # purely spatial inheritance (e.g. at a doorway) must not hand one
++            # person another person's UID when their appearance clearly disagrees
++            _embs =DB ._emb_cache .get (p )
++            if _embs :
++                _sims =np .asarray (_embs ,dtype =np .float32 )@l2_normalize (vec )
++                if float (np .mean (np .sort (_sims )[-3 :]))<RECOVER_MIN_SIM :
++                    continue
+         iou =_iou (box ,b )
+         center_d =math .hypot (cx -c [0 ],cy -c [1 ])/diag
+         prox =max (0.0 ,1.0 -(center_d /RECOVER_MAX_CENTER_FRAC ))
+@@ -1705,7 +1786,7 @@
+     cam_here =camera_map .get (src_idx )
+     busy =set ()
+     for k ,p in tracker_to_person .items ():
+-        if p .startswith ("T"):
++        if _is_temp_uid (p ):
+             continue
+         if k [0 ]==src_idx :
+             continue
+@@ -1722,6 +1803,138 @@
+     return busy
+ 
+ 
++def _tracks_concurrent (ka ,kb ,now ):
++    """True if tracks ka and kb are two DIFFERENT people visible at this very
++    moment on the same camera (both detected within PRESENT_WINDOW, distinct
++    boxes). Two such people can never share or merge a UID."""
++    if ka [0 ]!=kb [0 ]:
++        return False
++    cut =now -PRESENT_WINDOW
++    if tracker_present_ts .get (ka ,0.0 )<cut or tracker_present_ts .get (kb ,0.0 )<cut :
++        return False
++    ba ,bb =_track_last_box .get (ka ),_track_last_box .get (kb )
++    if ba is None or bb is None :
++        return False
++    return _box_iomin (ba ,bb )<DUP_BOX_IOMIN
++
++def _uids_present_on_camera (src_idx ,now ,box =None ,exclude_tkey =None ,window =None ):
++    """Real UIDs held by tracks on this camera that have been DETECTED within
++    `window` seconds. Stationary people count (no 'ever moved' requirement), and
++    a track that is only being coasted by the tracker does not. A holder whose
++    box heavily overlaps `box` is a duplicate track of the same person and is
++    not counted."""
++    window =PRESENT_WINDOW if window is None else window
++    cut =now -window
++    held =set ()
++    for k ,p in tracker_to_person .items ():
++        if k [0 ]!=src_idx or k ==exclude_tkey or _is_temp_uid (p ):
++            continue
++        if tracker_present_ts .get (k ,0.0 )<cut :
++            continue
++        kb =_track_last_box .get (k )
++        if box is not None and kb is not None and _box_iomin (box ,kb )>=DUP_BOX_IOMIN :
++            continue
++        held .add (p )
++    return held
++
++def _held_uids (src_idx ,now ,box ,tkey ,legacy_needs_moved ):
++    """UIDs a NEW/recovering track on this camera must not take. Presence-based:
++    a UID is held while its track is detected (+HOLDER_GRACE). LEGACY_HOLD=1 also
++    applies the old rule (live within UID_HOLD_SECONDS, shadow-coasting included)."""
++    held =_uids_present_on_camera (src_idx ,now ,box =box ,exclude_tkey =tkey ,window =HOLDER_GRACE )
++    if LEGACY_HOLD :
++        cut =now -UID_HOLD_SECONDS
++        for k ,p in tracker_to_person .items ():
++            if k ==tkey or _is_temp_uid (p )or k [0 ]!=src_idx :
++                continue
++            if tracker_last_seen .get (k ,0 )<cut :
++                continue
++            if legacy_needs_moved and not tracker_ever_moved .get (k ,False ):
++                continue
++            held .add (p )
++    return held
++
++def _demote_to_temp (k ,now ,reason =""):
++    """Return a track to its temporary UID so it re-identifies (the other
++    holder of the contested UID is excluded while it is visible)."""
++    old =tracker_to_person .get (k )
++    tracker_to_person [k ]=_temp_uid_for (k )
++    _track_emb_buffer [k ]={"vecs":[],"t0":now }
++    _last_gallery_update .pop (k ,None )
++    _last_gallery_update .pop (("merge",k ),None )
++    tracker_ever_moved [k ]=True
++    _uid_safety ["conflicts"]+=1
++    print (f"[UID-CONFLICT] {k } demoted {old } -> {tracker_to_person [k ]} ({reason })")
++
++def _uid_safety_pass (now ):
++    """Hard invariants, checked ~4x/second regardless of which code path
++    assigned a UID:
++      1. one UID can not be painted on two DIFFERENT people who are visible at
++         the same time (same camera, or two non-overlapping cameras): the older
++         holder keeps it, the younger is demoted to a temporary UID;
++      2. two different UIDs seen visible together for >= COEXIST_MIN_SEC are
++         different people: recorded as a permanent cannot-link so the DB refuses
++         to ever merge them."""
++    global _last_safety_ts
++    if now -_last_safety_ts <SAFETY_PASS_INTERVAL :
++        return
++    _last_safety_ts =now
++    cut =now -PRESENT_WINDOW
++    pres =[]
++    for k ,p in tracker_to_person .items ():
++        if _is_temp_uid (p )or tracker_present_ts .get (k ,0.0 )<cut :
++            continue
++        if tracker_hits .get (k ,0 )<MIN_TRACK_HITS :
++            continue
++        b =_track_last_box .get (k )
++        if b is not None :
++            pres .append ((k ,p ,b ))
++    if len (pres )<2 :
++        _coexist_since .clear ()
++        return
++
++    def _distinct (k1 ,b1 ,k2 ,b2 ):
++        if k1 [0 ]==k2 [0 ]:
++            return _box_iomin (b1 ,b2 )<DUP_BOX_IOMIN
++        c1 ,c2 =camera_map .get (k1 [0 ]),camera_map .get (k2 [0 ])
++        return not (GALLERY is not None and c1 and c2 and GALLERY ._cameras_overlap (c1 ,c2 ))
++
++    demoted =set ()
++    by_pid =defaultdict (list )
++    for k ,p ,b in pres :
++        by_pid [p ].append ((k ,b ))
++    for p ,items in by_pid .items ():
++        if len (items )<2 :
++            continue
++        items .sort (key =lambda kb :(tracker_first_seen_ts .get (kb [0 ],now ),-tracker_hits .get (kb [0 ],0 )))
++        w =items [0 ]
++        for k ,b in items [1 :]:
++            if _distinct (w [0 ],w [1 ],k ,b ):
++                _demote_to_temp (k ,now ,f"{p } also held by {w [0 ]}")
++                demoted .add (k )
++
++    live =[(k ,p ,b )for (k ,p ,b )in pres if k not in demoted ]
++    seen_now =set ()
++    for i in range (len (live )):
++        for j in range (i +1 ,len (live )):
++            k1 ,p1 ,b1 =live [i ];k2 ,p2 ,b2 =live [j ]
++            if p1 ==p2 or not _distinct (k1 ,b1 ,k2 ,b2 ):
++                continue
++            if DB .class_of (p1 )!=DB .class_of (p2 ):
++                continue
++            key =(p1 ,p2 )if p1 <p2 else (p2 ,p1 )
++            if DB .is_cannot_link (*key ):
++                continue
++            seen_now .add (key )
++            since =_coexist_since .setdefault (key ,now )
++            if now -since >=COEXIST_MIN_SEC and DB .add_cannot_link (key [0 ],key [1 ],now =now ):
++                _uid_safety ["cl_pairs"]+=1
++                print (f"[CANNOT-LINK] {key [0 ]} | {key [1 ]} seen together as two people "
++                f"({camera_map .get (k1 [0 ])} / {camera_map .get (k2 [0 ])}) -> never merged")
++    for key in list (_coexist_since ):
++        if key not in seen_now :
++            _coexist_since .pop (key ,None )
++
+ def _mcmtt_observe (pid ,vec ,cam ,now ,object_class =DEFAULT_OBJECT_CLASS ,good =True ):
+     """Record an observation into the global gallery (multi-view).
+ 
+@@ -1776,9 +1989,10 @@
+             return pid
+ 
+     exclude ={p for k ,p in tracker_to_person .items ()
+-    if k [0 ]==src_idx and not p .startswith ("T")}
++    if k [0 ]==src_idx and not _is_temp_uid (p )}
+     exclude .add (pid )
+-    for _p in list (DB ._meta_cache .keys ()):
++    exclude |=DB .cannot_links_of (pid )
++    for _p in DB .recent_pids ():
+         if _p in exclude :
+             continue
+         if DB .class_of (_p )!=object_class :
+@@ -1854,7 +2068,7 @@
+     _reap_last_ts [_rk ]=now
+     live ={}
+     for k ,p in tracker_to_person .items ():
+-        if k [0 ]!=src_idx or p .startswith ("T"):
++        if k [0 ]!=src_idx or _is_temp_uid (p ):
+             continue
+         if DB .class_of (p )!=object_class :
+             continue
+@@ -1875,6 +2089,10 @@
+     for i in range (len (pids )):
+         for j in range (i +1 ,len (pids )):
+             a ,b =pids [i ],pids [j ]
++            if CANNOT_LINK_ENABLE and (DB .is_cannot_link (a ,b )
++            or _tracks_concurrent (live [a ],live [b ],now )):
++                _uid_safety ["reap_skipped"]+=1
++                continue
+             s =float (np .dot (cents [a ],cents [b ]))
+             if s >=max (SIMILARITY_THRESHOLD ,DUP_REAP_MIN_SIM )and (best is None or s >best [2 ]):
+                 best =(a ,b ,s )
+@@ -1954,6 +2172,10 @@
+             _cam_last_frame_ts [cam ]=time .time ()
+ 
+             _suppressed_oids =suppress_overlaps (frame_meta ,iou_thresh =0.70 )
++            try :
++                _crowded_oids =crowded_objects (frame_meta ,_suppressed_oids ,src_idx )
++            except Exception :
++                _crowded_oids =set ()
+ 
+             _display_labels =[]
+             for obj in frame_meta .object_items :
+@@ -1997,7 +2219,7 @@
+ 
+                     if vec is not None :
+                         _ident =tracker_to_person .get (_tk )
+-                        if _ident is None or _ident .startswith ("T"):
++                        if _ident is None or _is_temp_uid (_ident ):
+                             _ident =_tk
+                         if not reid_health_record (vec ,_ident ):
+                             vec =None
+@@ -2054,7 +2276,8 @@
+                     int (r .top +r .height )>=FRAME_H -edge_margin )
+                     good_for_id =(vec is not None and
+                     raw_w >=MIN_BOX_W and raw_h >=MIN_BOX_H and
+-                    not (touches_edge and is_partial ))
++                    not (touches_edge and is_partial )and
++                    obj .object_id not in _crowded_oids )
+ 
+                     if not _NO_META_WRITE :
+                         r .left =left
+@@ -2077,6 +2300,8 @@
+                         _pconf =1.0
+                     if _pconf >=PRESENCE_CONF :
+                         tracker_present_ts [tkey ]=now
++                    _track_last_box [tkey ]=(float (r .left ),float (r .top ),
++                    float (r .width ),float (r .height ))
+                     _furniture_hide =False
+                     _person_count_local [0 ]+=1
+                     _cam_persons [cam ]+=1
+@@ -2128,7 +2353,7 @@
+ 
+                         _age_now =now -tracker_first_seen_ts .get (tkey ,now )
+                         _already_committed =(tkey in tracker_to_person
+-                        and not tracker_to_person [tkey ].startswith ("T"))
++                        and not _is_temp_uid (tracker_to_person [tkey ]))
+                         if (not _already_committed
+                         and not tracker_ever_moved .get (tkey ,False )
+                         and _age_now >=FIXTURE_LEARN_SECONDS
+@@ -2147,7 +2372,7 @@
+ 
+                     if tkey in tracker_to_person :
+                         pid =tracker_to_person [tkey ]
+-                        if pid .startswith ("T"):
++                        if _is_temp_uid (pid ):
+                             buf =_track_emb_buffer .setdefault (tkey ,{"vecs":[],"t0":now })
+                             if good_for_id and vec is not None :
+                                 buf ["vecs"].append (vec )
+@@ -2227,14 +2452,9 @@
+                                         _track_emb_buffer .pop (tkey ,None )
+                                     tracker_last_seen [tkey ]=now
+                                 else :
+-                                    active_cut =now -UID_HOLD_SECONDS
+-                                    other_pids ={
+-                                    p for k ,p in tracker_to_person .items ()
+-                                    if k !=tkey and not p .startswith ("T")
+-                                    and k [0 ]==src_idx
+-                                    and tracker_last_seen .get (k ,0 )>=active_cut
+-                                    and tracker_ever_moved .get (k ,False )}
+-                                    for _p in list (DB ._meta_cache .keys ()):
++                                    other_pids =_held_uids (src_idx ,now ,_track_last_box .get (tkey ),
++                                    tkey ,legacy_needs_moved =True )
++                                    for _p in DB .recent_pids ():
+                                         if _p in other_pids :
+                                             continue
+                                         if DB .class_of (_p )!=obj_class :
+@@ -2273,12 +2493,10 @@
+                                     else :
+                                         _cur_box =(float (r .left ),float (r .top ),
+                                         float (r .width ),float (r .height ))
+-                                        _active ={p for k ,p in tracker_to_person .items ()
+-                                        if k !=tkey and not p .startswith ("T")
+-                                        and k [0 ]==src_idx
+-                                        and tracker_last_seen .get (k ,0 )>=now -UID_HOLD_SECONDS }
++                                        _active =_held_uids (src_idx ,now ,_cur_box ,tkey ,
++                                        legacy_needs_moved =False )
+                                         _rec =_recover_local_uid (src_idx ,_cur_box ,now ,_active ,
+-                                        object_class =obj_class )
++                                        object_class =obj_class ,vec =avg )
+                                         if _rec is not None :
+                                             pid =_rec
+                                             DB .touch (pid ,cam =cam )
+@@ -2314,15 +2532,25 @@
+                                                 print (f"[NEW]   {tkey } -> {pid } "
+                                                 f"(best {score :.3f} < thr) on {cam } "
+                                                 f"| UID {_first }")
++                                                if NEW_DIAG :
++                                                    try :
++                                                        _cands =[c for c in DB .top_candidates (
++                                                        avg ,cam =cam ,object_class =obj_class ,k =4 )
++                                                        if c [1 ]!=pid ][:3 ]
++                                                        _fmt =[f"{_p }:{_s :.3f}{'X'if _x else 'S'}"
++                                                        f"{'!HELD'if _p in other_pids else ''}/{_a /3600.0 :.1f}h"
++                                                        for (_s ,_p ,_x ,_a )in _cands ]
++                                                        print (f"[NEW-DIAG] {tkey } on {cam } top3={_fmt } "
++                                                        f"(S=same-cam X=cross-cam !HELD=excluded /age)")
++                                                    except Exception :
++                                                        pass
+                                     tracker_to_person [tkey ]=pid
+                                     _track_emb_buffer .pop (tkey ,None )
+                             elif commit_reidless :
+                                 _cur_box =(float (r .left ),float (r .top ),
+                                 float (r .width ),float (r .height ))
+-                                _active ={p for k ,p in tracker_to_person .items ()
+-                                if k !=tkey and not p .startswith ("T")
+-                                and k [0 ]==src_idx
+-                                and tracker_last_seen .get (k ,0 )>=now -UID_HOLD_SECONDS }
++                                _active =_held_uids (src_idx ,now ,_cur_box ,tkey ,
++                                legacy_needs_moved =False )
+                                 _rec =_recover_local_uid (src_idx ,_cur_box ,now ,_active ,
+                                 object_class =obj_class )
+                                 if _rec is not None :
+@@ -2400,12 +2628,12 @@
+ 
+                     tracker_last_seen [tkey ]=now
+ 
+-                    if not pid .startswith ("T"):
++                    if not _is_temp_uid (pid ):
+                         _register_local_track (src_idx ,pid ,
+                         (float (r .left ),float (r .top ),float (r .width ),float (r .height )),
+                         now )
+ 
+-                    _committed =not pid .startswith ("T")
++                    _committed =not _is_temp_uid (pid )
+                     if 0 <=cid <len (LABELS ):
+                         tracker_class_votes [tkey ][cid ]+=1
+                         tracker_posture_recent [tkey ].append (cid )
+@@ -2440,12 +2668,12 @@
+                             key =lambda kv :kv [1 ])[0 ]
+                     stable_label =compose_label (demo_part ,posture_part )
+ 
+-                    if _furniture_hide and pid .startswith ("T"):
++                    if _furniture_hide and _is_temp_uid (pid ):
+                         _hide_obj (obj )
+                         tracker_last_seen [tkey ]=now
+                         continue
+ 
+-                    if pid .startswith ("T"):
++                    if _is_temp_uid (pid ):
+                         tag =f"{stable_label } (ID...)"
+                     else :
+                         tag =f"{stable_label } {pid }"
+@@ -2460,7 +2688,7 @@
+                         tot_per_cam [cam ]+=1
+                         if is_partial :
+                             partial_cnt [cam ]+=1
+-                    if not pid .startswith ("T"):
++                    if not _is_temp_uid (pid ):
+                         _cam_ids [cam ].add (pid )
+                         _touch_session (cam ,pid ,demo_part ,posture_part ,now )
+ 
+@@ -2477,6 +2705,12 @@
+             print (f"[FRAME ERROR] {exc }")
+             continue
+ 
++    if CANNOT_LINK_ENABLE :
++        try :
++            _uid_safety_pass (time .time ())
++        except Exception as _e :
++            print (f"[UID-SAFETY] pass error: {_e }")
++
+     with _log_lock :
+         _flush_frame_counter [0 ]+=1
+         if _flush_frame_counter [0 ]>=FLUSH_EVERY :
+@@ -2510,7 +2744,7 @@
+         f"raw_objects={_raw_obj_count } "
+         f"garbage_boxes={_bad_box_count } "
+         f"valid_persons={_person_count } "
+-        f"reid_vectors={_reid_count } db={DB .stats ()}")
++        f"reid_vectors={_reid_count } db={DB .stats ()} safety={_uid_safety }")
+         if REID_REPORT_EVERY and _frame_count %REID_REPORT_EVERY ==0 :
+             reid_health_report ()
+             camera_health_report ()
+@@ -2640,8 +2874,17 @@
+     f" (labels.txt is the filter; !nonperson to exclude)")
+     print (f"  Retention: {RETENTION_SECONDS /60 :.0f} min | same-cam recovery "
+     f"{RECOVER_MAX_GAP :.0f}s | reidless commit delayed {REIDLESS_COMMIT_DELAY :.0f}s")
+-    print (f"  UID lock: a committed UID is reserved to its track for "
+-    f"{UID_HOLD_SECONDS :.0f}s even while the person sits perfectly still")
++    if LEGACY_HOLD :
++        print (f"  UID lock (LEGACY): a committed UID is reserved to its track for "
++        f"{UID_HOLD_SECONDS :.0f}s even while the person sits perfectly still")
++    else :
++        print (f"  UID lock: a committed UID is held while its track is DETECTED "
++        f"(+{HOLDER_GRACE :.0f}s grace), static people included; a lost track's UID is released")
++    print (f"  UID safety: cannot-link={'ON'if CANNOT_LINK_ENABLE else 'OFF'} | "
++    f"reaper bar {max (SIMILARITY_THRESHOLD ,DUP_REAP_MIN_SIM ):.2f} | "
++    f"match pool <= {MATCH_MAX_AGE_SEC /3600.0 :.0f}h | "
++    f"crowd gate {CROWD_IOMIN :.2f} | recover floor {RECOVER_MIN_SIM :.2f} | "
++    f"NEW-DIAG={'ON'if NEW_DIAG else 'OFF'}")
+     print (f"  Personhood: MOTION confirms a person ({MOTION_FRAMES_FOR_PERSON } "
+     f"consecutive net-motion frames >={MOTION_STEP_MIN_PX :.0f}px, or "
+     f"{STATIC_MOVE_MIN_PX :.0f}px travel), latched for life")
+--- a/person_db.py
++++ b/person_db.py
+@@ -11,6 +11,12 @@
+ 
+ CONTAM_MARGIN = float(os.environ.get("REID_CONTAM_MARGIN", "0.05"))
+ 
++# Identities unseen for longer than this are NOT candidates for matching (0 =
++# no limit). Keeps the DB match pool consistent with the MCMTT gallery's own
++# retention: ReID embeddings are clothing-dominated, so week-old identities
++# mostly add false candidates (and scan cost), not true re-identifications.
++MATCH_MAX_AGE_SEC = float(os.environ.get("MATCH_MAX_AGE_SEC", "172800"))
++
+ DEFAULT_OBJECT_CLASS = "person"
+ 
+ DEFAULT_ABSENCE_SECONDS = 900.0
+@@ -83,6 +89,12 @@
+         self._touch_flush_ts = {}    # (pid, cam) -> last DB write time
+         self._touch_pending = {}     # (pid, cam) -> frames since last DB write
+ 
++        # Cannot-link registry: pairs of UIDs observed as two DIFFERENT people at
++        # the same instant (simultaneously visible, distinct boxes). Such a pair
++        # is never merged. {(a, b) with a < b: first_ts}
++        self._cannot = {}
++        self._cannot_by_uid = defaultdict(set)
++
+         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+         self._conn.execute("PRAGMA journal_mode=WAL;")
+         # WAL + NORMAL: consistent on power loss; only the last few seconds of
+@@ -195,6 +207,14 @@
+ 
+         c.execute("CREATE INDEX IF NOT EXISTS idx_emb_class ON embeddings(object_class)")
+ 
++        c.execute("""
++            CREATE TABLE IF NOT EXISTS cannot_link (
++                a  TEXT NOT NULL,
++                b  TEXT NOT NULL,
++                ts REAL,
++                PRIMARY KEY (a, b)
++            )""")
++
+         for pid, ca, ls in c.execute(
+                 "SELECT person_id, created_at, last_seen FROM persons").fetchall():
+             c.execute("UPDATE persons SET first_seen_str=?, last_seen_str=? "
+@@ -238,6 +258,19 @@
+                 self._emb_cache[pid] = self._emb_cache[pid][-self.max_emb:]
+                 self._mat_cache.pop(pid, None)
+ 
++        try:
++            _n_cl = 0
++            for a, b, ts in c.execute("SELECT a, b, ts FROM cannot_link"):
++                if a in self._meta_cache and b in self._meta_cache:
++                    self._cannot[(a, b) if a < b else (b, a)] = ts
++                    self._cannot_by_uid[a].add(b)
++                    self._cannot_by_uid[b].add(a)
++                    _n_cl += 1
++            if _n_cl:
++                print(f"[DB] Loaded {_n_cl} cannot-link pair(s)")
++        except Exception as e:
++            print(f"[DB] cannot_link load failed: {e}")
++
+         print(f"[DB] Loaded {len(self._meta_cache)} persons, "
+               f"{loaded} embeddings from {self.db_path}")
+ 
+@@ -331,11 +364,12 @@
+               exclude=None,
+               posture_threshold=None, posture_window=12.0,
+               cross_camera_floor=None, cross_margin=0.12,
+-              require_absent_seconds=None):
++              require_absent_seconds=None, max_age=None):
+ 
+         vec = _l2(vec)
+         now = time.time()
+         exclude = exclude or set()
++        _age_cut = MATCH_MAX_AGE_SEC if max_age is None else float(max_age)
+ 
+         scored = []
+         for pid, embs in self._emb_cache.items():
+@@ -344,6 +378,8 @@
+             meta = self._meta_cache.get(pid, {})
+             if meta.get("class", DEFAULT_OBJECT_CLASS) != object_class:
+                 continue
++            if _age_cut and (now - meta.get("last_seen", 0)) > _age_cut:
++                continue
+             if require_absent_seconds is not None:
+                 if (now - meta.get("last_seen", 0)) < require_absent_seconds:
+                     continue
+@@ -408,6 +444,40 @@
+ 
+         return None, best_score
+ 
++    def top_candidates(self, vec, cam=None, object_class=DEFAULT_OBJECT_CLASS,
++                       k=3, max_age=None, topk=3):
++        """Diagnostics only (never affects a decision): the k best-scoring
++        candidate identities for `vec`, as (raw_top_mean_similarity, pid,
++        is_cross_camera, age_seconds). Uses the same scoring and the same
++        age-limited pool as match(), but without boost/exclusion, so it shows
++        WHY a new UID was minted."""
++        vec = _l2(vec)
++        now = time.time()
++        cut = MATCH_MAX_AGE_SEC if max_age is None else float(max_age)
++        out = []
++        for pid, embs in self._emb_cache.items():
++            if not embs:
++                continue
++            meta = self._meta_cache.get(pid, {})
++            if meta.get("class", DEFAULT_OBJECT_CLASS) != object_class:
++                continue
++            age = now - meta.get("last_seen", 0)
++            if cut and age > cut:
++                continue
++            mat = self._mat_cache.get(pid)
++            if mat is None or mat.shape[0] != len(embs):
++                mat = np.asarray(embs, dtype=np.float32)
++                self._mat_cache[pid] = mat
++            sims = mat @ vec
++            kk = min(topk, sims.shape[0])
++            top_mean = float(np.mean(np.sort(sims)[-kk:]))
++            cams = meta.get("cams") or set()
++            is_cross = bool(cam) and not self._is_effectively_same_cam(
++                cam, cams, meta.get("last_cam"))
++            out.append((top_mean, pid, is_cross, age))
++        out.sort(reverse=True)
++        return out[:k]
++
+     def restore_candidates(self, vec, object_class=DEFAULT_OBJECT_CLASS,
+                             cam=None, min_absence_seconds=DEFAULT_ABSENCE_SECONDS,
+                             threshold=0.55, cross_camera_threshold=0.45,
+@@ -527,6 +597,11 @@
+                   f"{keep_pid}({keep_class}): cross-class merge blocked")
+             return False
+ 
++        if self.is_cannot_link(keep_pid, drop_pid):
++            print(f"[DB] REFUSED merge {drop_pid} -> {keep_pid}: cannot-link "
++                  f"(seen simultaneously as two different people)")
++            return False
++
+         if dm.get("first_seen") and (not km.get("first_seen")
+                                       or dm["first_seen"] < km["first_seen"]):
+             km["first_seen"] = dm["first_seen"]
+@@ -586,6 +661,14 @@
+         for _k in [k for k in self._touch_flush_ts if k[0] == drop_pid]:
+             self._touch_flush_ts.pop(_k, None)
+             self._touch_pending.pop(_k, None)
++        try:                                    # cannot-links follow the surviving UID
++            _others = list(self._cannot_by_uid.get(drop_pid, ()))
++            self._purge_cannot_links(drop_pid)
++            for _o in _others:
++                if _o != keep_pid:
++                    self.add_cannot_link(keep_pid, _o)
++        except Exception as e:
++            print(f"[DB] cannot-link transfer failed: {e}")
+         self._conn.execute(
+             "UPDATE persons SET num_embeddings=? WHERE person_id=?",
+             (len(merged), keep_pid))
+@@ -598,6 +681,49 @@
+         m = self._meta_cache.get(pid)
+         return set(m.get("cams") or set()) if m else set()
+ 
++    def recent_pids(self, max_age=None):
++        """UIDs seen within max_age seconds (default MATCH_MAX_AGE_SEC; 0 = all).
++        Same pool match() searches; callers that loop over identities use this
++        instead of every UID ever minted."""
++        cut = MATCH_MAX_AGE_SEC if max_age is None else float(max_age)
++        if not cut:
++            return list(self._meta_cache.keys())
++        now = time.time()
++        return [p for p, m in self._meta_cache.items()
++                if (now - m.get("last_seen", 0)) <= cut]
++
++    # ---- cannot-link registry ------------------------------------------
++    def add_cannot_link(self, a, b, now=None):
++        """Record that UIDs a and b were seen as two different people at the
++        same instant. Returns True if newly recorded."""
++        if a == b or a not in self._meta_cache or b not in self._meta_cache:
++            return False
++        key = (a, b) if a < b else (b, a)
++        if key in self._cannot:
++            return False
++        ts = now if now is not None else time.time()
++        self._cannot[key] = ts
++        self._cannot_by_uid[a].add(b)
++        self._cannot_by_uid[b].add(a)
++        self._conn.execute(
++            "INSERT OR IGNORE INTO cannot_link(a, b, ts) VALUES (?,?,?)",
++            (key[0], key[1], ts))
++        self._dirty = True
++        return True
++
++    def is_cannot_link(self, a, b):
++        return ((a, b) if a < b else (b, a)) in self._cannot
++
++    def cannot_links_of(self, pid):
++        return set(self._cannot_by_uid.get(pid, ()))
++
++    def _purge_cannot_links(self, pid):
++        for o in list(self._cannot_by_uid.get(pid, ())):
++            self._cannot.pop((pid, o) if pid < o else (o, pid), None)
++            self._cannot_by_uid[o].discard(pid)
++        self._cannot_by_uid.pop(pid, None)
++        self._conn.execute("DELETE FROM cannot_link WHERE a=? OR b=?", (pid, pid))
++
+     def add_embedding(self, pid, vec, cam=None, object_class=None,
+                        outlier_floor=0.40, guard_contamination=True):
+         """Append a new embedding to an EXISTING identity.
+@@ -633,12 +759,15 @@
+ 
+             if guard_contamination:
+                 best_other = 0.0
++                _ce_now = time.time()
+                 for opid, oembs in self._emb_cache.items():
+                     if opid == pid or not oembs:
+                         continue
+                     ometa = self._meta_cache.get(opid, {})
+                     if ometa.get("class", DEFAULT_OBJECT_CLASS) != stored_class:
+                         continue
++                    if MATCH_MAX_AGE_SEC and (_ce_now - ometa.get("last_seen", 0)) > MATCH_MAX_AGE_SEC:
++                        continue
+                     om = self._mat_cache.get(opid)
+                     if om is None or om.shape[0] != len(oembs):
+                         om = np.asarray(oembs, dtype=np.float32)
+@@ -803,6 +932,10 @@
+         self._emb_cache.pop(pid, None)
+         self._mat_cache.pop(pid, None)
+         self._meta_cache.pop(pid, None)
++        try:
++            self._purge_cannot_links(pid)
++        except Exception as e:
++            print(f"[DB] cannot-link purge failed: {e}")
+         for _k in [k for k in self._touch_flush_ts if k[0] == pid]:
+             self._touch_flush_ts.pop(_k, None)
+             self._touch_pending.pop(_k, None)
+@@ -964,6 +1097,7 @@
+             "persons_by_class": dict(by_class),
+             "total_embeddings": sum(len(v) for v in self._emb_cache.values()),
+             "open_incidents": len(self._open_incidents),
++            "cannot_links": len(self._cannot),
+         }
+ 
+ 
