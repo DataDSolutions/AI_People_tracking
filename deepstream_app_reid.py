@@ -19,12 +19,15 @@ from pyservicemaker import osd as _osd
 from person_db import PersonDatabase ,DEFAULT_OBJECT_CLASS ,MATCH_MAX_AGE_SEC
 from shutdown_handler import ShutdownManager
 
-CAMERA_STREAMS =[
-
-{"name":"camera_1","uri":"rtsp://sanjay:prama8833@192.168.88.28:554/Streaming/channels/301"},
-{"name":"camera_2","uri":"rtsp://sanjay:prama8833@192.168.88.28:554/Streaming/channels/801"},
-{"name":"camera_3","uri":"rtsp://sanjay:prama8833@192.168.88.28:554/Streaming/channels/201"},
-{"name":"camera_4","uri":"rtsp://sanjay:prama8833@192.168.88.28:554/Streaming/channels/501"},
+import os
+_rtsp_user = os.environ.get("RTSP_USER", "")
+_rtsp_pass = os.environ.get("RTSP_PASS", "")
+_rtsp_host = os.environ.get("RTSP_HOST", "")
+CAMERA_STREAMS = [
+    {"name": "camera_1", "uri": f"rtsp://{_rtsp_user}:{_rtsp_pass}@{_rtsp_host}/{os.environ.get('RTSP_CAM1_PATH', '')}"},
+    {"name": "camera_2", "uri": f"rtsp://{_rtsp_user}:{_rtsp_pass}@{_rtsp_host}/{os.environ.get('RTSP_CAM2_PATH', '')}"},
+    {"name": "camera_3", "uri": f"rtsp://{_rtsp_user}:{_rtsp_pass}@{_rtsp_host}/{os.environ.get('RTSP_CAM3_PATH', '')}"},
+    {"name": "camera_4", "uri": f"rtsp://{_rtsp_user}:{_rtsp_pass}@{_rtsp_host}/{os.environ.get('RTSP_CAM4_PATH', '')}"},
 ]
 
 ONLY_CAMERA_INDEX =None

@@ -1,0 +1,5 @@
+.env
+*.db
+*.engine
+__pycache__/
+*.pyc
